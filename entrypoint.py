@@ -4,8 +4,10 @@ import subprocess
 import argparse
 import os
 import sys
+import signal
+from contextlib import closing
 
-def is_frps_alive(port):
+def is_backend_alive(port):
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=1)
         s.close()
@@ -24,43 +26,105 @@ def pipe(src, dst):
         src.close()
         dst.close()
 
-def handle_client(client_sock, target_port):
-    if is_frps_alive(target_port):
-        try:
-            target_sock = socket.create_connection(("127.0.0.1", target_port))
-            threading.Thread(target=pipe, args=(client_sock, target_sock)).start()
-            threading.Thread(target=pipe, args=(target_sock, client_sock)).start()
-        except Exception as e:
-            client_sock.send(b"Error connecting to frps proxy\r\n")
-            client_sock.close()
-    else:
-        client_sock.send(b"frps not ready\r\n")
+def send_placeholder(client_sock, http_200=False, message=None):
+    try:
+        msg = message or b"service not ready\r\n"
+        if isinstance(msg, str):
+            msg = msg.encode()
+        if http_200:
+            body = msg
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Cache-Control: no-cache\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            client_sock.sendall(resp)
+        else:
+            client_sock.sendall(msg)
+    finally:
         client_sock.close()
 
-def start_health_proxy(listen_port, target_port):
-    server = socket.socket()
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", listen_port))
-    server.listen(5)
-    print(f"[health-proxy] Listening on {listen_port}, forwarding to {target_port}")
 
-    while True:
-        client_sock, _ = server.accept()
-        threading.Thread(target=handle_client, args=(client_sock, target_port)).start()
+def handle_client(client_sock, target_port, placeholder_http, placeholder_message):
+    if is_backend_alive(target_port):
+        try:
+            target_sock = socket.create_connection(("127.0.0.1", target_port))
+            t1 = threading.Thread(target=pipe, args=(client_sock, target_sock), daemon=True)
+            t2 = threading.Thread(target=pipe, args=(target_sock, client_sock), daemon=True)
+            t1.start()
+            t2.start()
+        except Exception as e:
+            send_placeholder(client_sock, placeholder_http, placeholder_message or b"backend connect error\r\n")
+    else:
+        send_placeholder(client_sock, placeholder_http, placeholder_message or b"service not ready\r\n")
+
+def start_proxy(listen_host, listen_port, target_port, placeholder_http, placeholder_message, stop_event):
+    with closing(socket.socket()) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((listen_host, listen_port))
+        server.listen(64)
+        server.settimeout(1.0)
+        print(f"[proxy] Listening on {listen_host}:{listen_port}, forwarding to 127.0.0.1:{target_port}")
+
+        while not stop_event.is_set():
+            try:
+                client_sock, _ = server.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(
+                target=handle_client,
+                args=(client_sock, target_port, placeholder_http, placeholder_message),
+                daemon=True,
+            ).start()
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--listen-port", type=int, default=int(os.getenv("LISTEN_PORT", "8081")))
-    parser.add_argument("--target-port", type=int, default=int(os.getenv("TARGET_PORT", "6000")))
+    parser.add_argument("--listen-host", default=os.getenv("LISTEN_HOST", "0.0.0.0"))
+    parser.add_argument("--listen-port", type=int, default=int(os.getenv("LISTEN_PORT", "6000")))
+    parser.add_argument("--target-port", type=int, default=int(os.getenv("TARGET_PORT", "7000")))
+    parser.add_argument("--placeholder-http", action="store_true", default=os.getenv("PLACEHOLDER_HTTP_200", "0") == "1")
+    parser.add_argument("--placeholder-message", default=os.getenv("PLACEHOLDER_MESSAGE", "service not ready\r\n"))
+    parser.add_argument("--frps-bin", default=os.getenv("FRPS_BIN", "/usr/bin/frps"))
     args, unknown = parser.parse_known_args()
 
-    # 启动 frps 子进程
-    frps_cmd = ["/usr/bin/frps"] + unknown
+    # 启动 frps 子进程（端口/配置通过命令行 unknown 透传，例如 -p 443 或 -c /path/to/frps.ini）
+    frps_cmd = [args.frps_bin] + unknown
     print(f"[entrypoint] Starting frps with: {' '.join(frps_cmd)}")
-    subprocess.Popen(frps_cmd)
+    frps_proc = subprocess.Popen(frps_cmd)
 
-    # 启动健康检查代理
-    start_health_proxy(args.listen_port, args.target_port)
+    stop_event = threading.Event()
+
+    def handle_signals(signum, frame):
+        print(f"[entrypoint] Caught signal {signum}, shutting down...")
+        stop_event.set()
+        try:
+            frps_proc.terminate()
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGTERM, handle_signals)
+    signal.signal(signal.SIGINT, handle_signals)
+
+    try:
+        start_proxy(
+            args.listen_host,
+            args.listen_port,
+            args.target_port,
+            args.placeholder_http,
+            args.placeholder_message,
+            stop_event,
+        )
+    finally:
+        # 等待 frps 退出
+        try:
+            frps_proc.wait(timeout=5)
+        except Exception:
+            try:
+                frps_proc.kill()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

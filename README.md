@@ -22,6 +22,49 @@
 - `-p 443`：frps 监听 443
 - `-c /path/to/frps.ini`：使用外部挂载的配置文件（本项目未在镜像内内置 frps.ini）
 
+## TOML 配置（无 WebSocket，443/TCP + TLS）
+
+如果你的上游不支持 WebSocket（例如某些企业出口仅允许 443/TCP 并要求 TLS），推荐使用 frp 的传输层 TLS，并让 443 作为 TCP 直通到容器 443（不要在平台层做 HTTP/TLS 终止）。
+
+示例 `frps.toml`（已包含在仓库，路径 `./frps.toml`，部署时拷贝/挂载到容器 `/app/frps.toml`）：
+
+```toml
+[common]
+bind_port = 443
+
+authentication.method = "token"
+# 使用单引号可避免特殊字符转义；请替换为你的密钥
+authentication.token  = 'CHANGE_ME_WITH_YOUR_SECRET_TOKEN'
+
+# 可选：仅开放需要的业务端口（与 wrapper TARGET_PORT 对齐）
+# allow_ports = "7000-7000"
+
+# 启用 frp 自带 TLS（frpc 需同时开启 transport.tls.enable=true）
+transport.tls.force = true
+
+log_level         = "info"
+disable_log_color = true
+```
+
+启动容器时将参数传给 frps（入口点已固定为 `python -u entrypoint.py`）：
+
+```powershell
+docker run --name ddd-frps -d \
+  -p 6000:6000 \
+  -p 443:443 \
+  -e LISTEN_PORT=6000 \
+  -e TARGET_PORT=7000 \
+  -e PLACEHOLDER_HTTP_200=1 \
+  -e FRPS_TOKEN=YourSecretToken \
+  ddd-frps-wrapper:local \
+  -c /app/frps.toml
+```
+
+注意事项：
+- Koyeb/平台上的 443 端口类型请选择 TCP 直通，不要选择 HTTP（否则 frpc 会立即 EOF，服务端无日志）。
+- TOML 中用单引号包裹 token，可避免转义导致的“token 不正确”。
+- 如果你仍需使用 INI，请保持 `authentication.method = token` 与 `authentication.token` 写法一致；但更推荐 TOML。
+
 ## 示例（参考）
 
 在本地 Docker（或 Koyeb）中：

@@ -94,6 +94,31 @@ docker run --name ddd-frps -d \
 - 后端就绪：纯 TCP 层转发（可用于 HTTP 等上层协议）
 - 退出处理：容器收到 SIGTERM/SIGINT 时会优雅停止代理并终止 frps
 
+## 仅对“平台健康检查”返回 200（可选）
+
+如果你希望“正常用户流量”在后端未就绪时仍收到占位信息，但平台的健康检查始终拿到 200，可以启用（默认已开启）“健康检查 Header 快速路径”。
+
+- HEALTH_HEADER / --health-header：匹配一个特定 HTTP 头即可直接返回 200，不访问后端（默认 `X-Health-Check`）。
+  - 写法一：`X-Health-Check=1`（匹配键值）
+  - 写法二：`X-Health-Check`（仅判断存在）
+- HEALTH_RESPONSE_MESSAGE / --health-response-message：命中时返回的文本正文（默认 `ok`）
+- HEALTH_TIMEOUT_MS / --health-timeout-ms：读取并解析 HTTP 头的微小等待时长，默认 `100` 毫秒（不会影响普通请求转发）
+- HEALTH_MAX_BYTES / --health-max-bytes：窥探最大字节数（MSG_PEEK，不消费数据），默认 `1024`。若未发现完整 HTTP 头（\r\n\r\n），将直接走普通转发。
+
+工作方式：
+1) 代理在接受到一个连接后，使用 MSG_PEEK 最多窥探 `HEALTH_MAX_BYTES`（默认 1024），若检测到完整 HTTP 头（`\r\n\r\n`），进行轻量解析；
+2) 若匹配到指定 Header，立即回复 `HTTP/1.1 200 OK` 与给定正文，并关闭连接；
+3) 若未匹配，则把已读取的请求数据完整转发给后端，行为与默认代理一致。
+
+建议在平台健康检查中添加请求头，例如：`X-Health-Check: 1`。同时设置环境变量：
+
+```bash
+-e HEALTH_HEADER="X-Health-Check=1" \
+-e HEALTH_RESPONSE_MESSAGE="ok" \
+```
+
+注意：该能力仅在请求是 HTTP 时生效；非 HTTP（如 TLS 握手或自定义二进制协议）不会误判。若在窥探的 `HEALTH_MAX_BYTES` 内未形成完整 HTTP 头，代理不会额外阻塞读取，直接按普通代理处理，确保高效。
+
 ## 文件结构
 
 - Dockerfile：构建镜像，下载并安装 frps

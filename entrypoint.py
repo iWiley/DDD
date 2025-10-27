@@ -91,7 +91,7 @@ def handle_client(client_sock, target_port, placeholder_http, placeholder_messag
     else:
         send_placeholder(client_sock, placeholder_http, placeholder_message or b"service not ready\r\n")
 
-def start_proxy(listen_host, listen_port, target_port, placeholder_http, placeholder_message, stop_event):
+def start_proxy(listen_host, listen_port, target_port, placeholder_http, placeholder_message, stop_event, debug=False):
     try:
         with closing(socket.socket()) as server:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -102,9 +102,19 @@ def start_proxy(listen_host, listen_port, target_port, placeholder_http, placeho
 
             while not stop_event.is_set():
                 try:
-                    client_sock, _ = server.accept()
+                    client_sock, addr = server.accept()
                 except socket.timeout:
                     continue
+                if debug:
+                    try:
+                        local_addr = client_sock.getsockname()
+                        print(
+                            f"[proxy] connection from {addr[0]}:{addr[1]} -> local {local_addr[0]}:{local_addr[1]} (forward to 127.0.0.1:{target_port})"
+                        )
+                    except Exception:
+                        print(
+                            f"[proxy] connection accepted on {listen_host}:{listen_port} (forward to 127.0.0.1:{target_port})"
+                        )
                 threading.Thread(
                     target=handle_client,
                     args=(client_sock, target_port, placeholder_http, placeholder_message),
@@ -122,6 +132,7 @@ def main():
     parser.add_argument("--placeholder-http", action="store_true", default=os.getenv("PLACEHOLDER_HTTP_200", "0") == "1")
     parser.add_argument("--placeholder-message", default=os.getenv("PLACEHOLDER_MESSAGE", "service not ready\r\n"))
     parser.add_argument("--frps-bin", default=os.getenv("FRPS_BIN", "/usr/bin/frps"))
+    parser.add_argument("--debug", action="store_true", default=os.getenv("DEBUG", "0") == "1")
     args, unknown = parser.parse_known_args()
 
     # 解析多映射：优先 --map，其次 PROXY_MAPS 环境变量，最后回退到单对 listen/target
@@ -176,7 +187,7 @@ def main():
     for lp, tp in maps:
         t = threading.Thread(
             target=start_proxy,
-            args=(args.listen_host, lp, tp, args.placeholder_http, args.placeholder_message, stop_event),
+            args=(args.listen_host, lp, tp, args.placeholder_http, args.placeholder_message, stop_event, args.debug),
             daemon=True,
         )
         t.start()

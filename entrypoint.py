@@ -18,15 +18,38 @@ def is_backend_alive(port):
         return False
 
 def pipe(src, dst):
+    """
+    单向拷贝：从 src 读，写入 dst。
+    - 仅在本线程中关闭 src（读端）；不直接关闭 dst，避免与对向线程竞争导致 Bad file descriptor。
+    - 当读到 EOF 时，半关闭对端写（shutdown(SHUT_WR)）提示对端完成写入。
+    - 捕获 OSError/IOError，安静退出。
+    """
     try:
         while True:
-            data = src.recv(4096)
-            if not data:
+            try:
+                data = src.recv(4096)
+            except OSError:
                 break
-            dst.sendall(data)
+            if not data:
+                # 对端读完，半关闭写端，提示完成
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
+                break
+            try:
+                dst.sendall(data)
+            except OSError:
+                break
     finally:
-        src.close()
-        dst.close()
+        try:
+            try:
+                src.shutdown(socket.SHUT_RD)
+            except Exception:
+                pass
+            src.close()
+        except Exception:
+            pass
 
 def send_placeholder(client_sock, http_200=False, message=None):
     try:
